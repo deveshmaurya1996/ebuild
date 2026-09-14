@@ -457,8 +457,8 @@ def _stub_ar(tmp_path) -> Path:
 class TestStaticArchiveRecreation:
     """Removing a static-library source must drop its object from the archive."""
 
-    def test_ar_rule_recreates_via_helper_module(self, tmp_path):
-        """The generated rule must delete-then-archive, not only ``ar rcs``."""
+    def test_ar_rule_invokes_helper_by_path(self, tmp_path):
+        """The generated rule must delete-then-archive via the helper script."""
         target = TargetConfig(
             name="helpers", target_type="static_library", sources=["keep.c"]
         )
@@ -470,7 +470,8 @@ class TestStaticArchiveRecreation:
         ninja = (build_dir / "build.ninja").read_text(encoding="utf-8")
 
         ar_rule = ninja.split("rule ar_rule\n", 1)[1].split("\nrule ", 1)[0]
-        assert "ebuild.build.recreate_archive" in ar_rule
+        assert "recreate_archive.py" in ar_rule
+        assert "-m ebuild.build.recreate_archive" not in ar_rule
         assert ar_rule.strip().startswith("command =")
         # The bare update form is exactly the bug; it must not be the rule body.
         assert "command = $ar rcs $out $in" not in ninja
@@ -537,15 +538,107 @@ class TestStaticArchiveRecreation:
         assert "removed.o" not in members(), members()
         assert "keep.o" in members(), members()
 
-    def test_missing_archiver_is_a_clear_error(self, tmp_path):
-        """A missing `$ar` must not surface as an uncaught Python traceback."""
+    def test_archive_rule_works_without_ebuild_on_path(self, tmp_path):
+        """The AR helper must not require ``import ebuild`` at build time.
+
+        ``python -m ebuild.build.recreate_archive`` fails when ebuild is only
+        reachable via cwd/PYTHONPATH (or when site-packages are disabled).
+        Invoking the helper by absolute path must still succeed.
+        """
+        import os
+
+        source_dir = tmp_path / "project"
+        source_dir.mkdir()
+        (source_dir / "lib.c").write_text("int value(void) { return 1; }\n", encoding="utf-8")
+
+        ar = _stub_ar(tmp_path)
+        config = ProjectConfig(
+            name="no-import",
+            version="1.0",
+            source_dir=source_dir,
+            targets=[
+                TargetConfig(
+                    name="helpers",
+                    target_type="static_library",
+                    sources=["lib.c"],
+                )
+            ],
+        )
+        build_dir = source_dir / "build"
+        NinjaBackend(
+            config, build_dir, SimpleNamespace(cc="cc", cxx="c++", ar=str(ar))
+        ).generate()
+
+        ninja = (build_dir / "build.ninja").read_text(encoding="utf-8")
+        ar_rule = ninja.split("rule ar_rule\n", 1)[1].split("\nrule ", 1)[0]
+        assert "recreate_archive.py" in ar_rule
+        assert "-m ebuild" not in ar_rule
+
+        from ebuild.build import recreate_archive as recreate_mod
+
+        helper = Path(recreate_mod.__file__).resolve()
+        archive = build_dir / "libhelpers.a"
+        obj = build_dir / "obj" / "helpers" / "lib.o"
+        obj.parent.mkdir(parents=True)
+        obj.write_bytes(b"obj:lib.c")
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PYTHONPATH"] = ""
+
+        # -S drops site-packages so an editable install of ebuild is invisible,
+        # matching a checkout that only puts the package on PYTHONPATH.
+        module_form = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                "-m",
+                "ebuild.build.recreate_archive",
+                str(archive),
+                str(ar),
+                "rcs",
+                str(archive),
+                str(obj),
+            ],
+            cwd=str(outside),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert module_form.returncode != 0
+        assert "No module named 'ebuild'" in module_form.stderr + module_form.stdout
+
+        path_form = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                str(helper),
+                str(archive),
+                str(ar),
+                "rcs",
+                str(archive),
+                str(obj),
+            ],
+            cwd=str(outside),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert path_form.returncode == 0, path_form.stdout + path_form.stderr
+        assert archive.exists()
+        assert "lib.o" in archive.read_text(encoding="utf-8")
+
+    def test_missing_archiver_preserves_existing_archive(self, tmp_path):
+        """A missing `$ar` must fail without deleting a previously good archive."""
         from ebuild.build.recreate_archive import main
 
         archive = tmp_path / "lib.a"
         archive.write_text("stale\n", encoding="utf-8")
         code = main([str(archive), str(tmp_path / "no-such-ar"), "rcs", str(archive)])
         assert code == 1
-        assert not archive.exists()
+        assert archive.exists()
+        assert archive.read_text(encoding="utf-8") == "stale\n"
 
 
 if __name__ == "__main__":

@@ -77,6 +77,9 @@ toolchain. The stub archiver keeps omitted members the way real `ar r` does;
 after a source is removed, the rebuilt archive must not list that object.
 
 `ar_rule` recreates the archive when its build step runs: updating an existing
-archive with `ar rcs` alone retains members removed from the source list.
-`build.ninja` embeds the generating interpreter path for that helper, so
-regenerate the manifest if the environment's Python moves.
+archive with `ar rcs` alone retains members removed from the source list. The
+rule invokes `recreate_archive.py` by absolute path through the generating
+Python interpreter, so Ninja needs that interpreter at build time for every
+`static_library` edge. Regenerate `build.ninja` if the environment's Python
+moves. The helper is not imported as `ebuild.*`, so a bare checkout that only
+puts the package on `PYTHONPATH` still works.
