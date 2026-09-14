@@ -109,3 +109,10 @@ These commands were derived from the manifests at the repository root. Confirm o
   [ORCHESTRATION.md](./ORCHESTRATION.md) is met and the verification commands
   were actually run.
 - `blocked` requires a note naming what it is blocked on and who can unblock it.
+
+## Baseline findings during static-archive validation
+
+Unchanged commit `76970c9` and the archive fix share the same nine failures:
+missing `PackageRecipe.to_dict` in `tests/unit/test_index_sync.py`. Full suite
+after this change: **671 passed, 9 failed, 6 skipped** on Windows with Python
+3.13. Those nine failures are outside the archive fix.

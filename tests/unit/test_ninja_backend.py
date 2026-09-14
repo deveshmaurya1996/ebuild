@@ -360,5 +360,193 @@ class TestNinjaPathEscaping:
             assert "$ " not in entry["command"]
 
 
+def _stub_tool(tmp_path, name: str, script_body: str) -> Path:
+    """A host tool stand-in driven by sys.executable.
+
+    Same pattern as ``tests/unit/test_package_efw.py``: Windows cannot run a
+    ``#!/bin/sh`` script, so the launcher is a ``.bat`` there and a shell
+    wrapper elsewhere.
+    """
+    import os
+    import stat
+
+    script = tmp_path / f"_{name}_impl.py"
+    script.write_text(script_body, encoding="utf-8")
+    if os.name == "nt":
+        tool = tmp_path / f"{name}.bat"
+        tool.write_text(
+            f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8"
+        )
+    else:
+        tool = tmp_path / name
+        tool.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8"
+        )
+        tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+    return tool
+
+
+def _stub_cc(tmp_path) -> Path:
+    """Compile by writing the object and a trivial depfile — no real compiler."""
+    return _stub_tool(
+        tmp_path,
+        "cc",
+        "\n".join(
+            [
+                "import pathlib, sys",
+                "argv = sys.argv[1:]",
+                "out = dep = src = None",
+                "i = 0",
+                "while i < len(argv):",
+                "    if argv[i] == '-o' and i + 1 < len(argv):",
+                "        out = argv[i + 1]; i += 2",
+                "    elif argv[i] == '-MF' and i + 1 < len(argv):",
+                "        dep = argv[i + 1]; i += 2",
+                "    elif argv[i] == '-c' and i + 1 < len(argv):",
+                "        src = argv[i + 1]; i += 2",
+                "    else:",
+                "        i += 1",
+                "path = pathlib.Path(out)",
+                "path.parent.mkdir(parents=True, exist_ok=True)",
+                "path.write_bytes(b'obj:' + pathlib.Path(src).name.encode())",
+                "if dep:",
+                "    pathlib.Path(dep).write_text(f'{out}: {src}\\n', encoding='utf-8')",
+                "",
+            ]
+        ),
+    )
+
+
+def _stub_ar(tmp_path) -> Path:
+    """Archiver with real ``ar r`` update semantics: omitted members stay.
+
+    That is the defect under test. If the Ninja rule only runs ``ar rcs``
+    against an existing archive, removed objects survive. Recreating the
+    archive first makes this stub retain only the current inputs.
+    """
+    return _stub_tool(
+        tmp_path,
+        "ar",
+        "\n".join(
+            [
+                "import pathlib, sys",
+                "op = sys.argv[1]",
+                "archive = pathlib.Path(sys.argv[2])",
+                "members = sys.argv[3:]",
+                "if op == 't':",
+                "    sys.stdout.write(archive.read_text(encoding='utf-8') if archive.exists() else '')",
+                "    raise SystemExit(0)",
+                "if 'r' not in op:",
+                "    raise SystemExit(f'unsupported ar op: {op}')",
+                "names = {}",
+                "if archive.exists():",
+                "    for line in archive.read_text(encoding='utf-8').splitlines():",
+                "        if line:",
+                "            names[pathlib.Path(line).name] = pathlib.Path(line).name",
+                "for member in members:",
+                "    names[pathlib.Path(member).name] = pathlib.Path(member).name",
+                "archive.parent.mkdir(parents=True, exist_ok=True)",
+                "archive.write_text(('\\n'.join(names.values()) + '\\n') if names else '', encoding='utf-8')",
+                "",
+            ]
+        ),
+    )
+
+
+@pytest.mark.ebuild
+class TestStaticArchiveRecreation:
+    """Removing a static-library source must drop its object from the archive."""
+
+    def test_ar_rule_recreates_via_helper_module(self, tmp_path):
+        """The generated rule must delete-then-archive, not only ``ar rcs``."""
+        target = TargetConfig(
+            name="helpers", target_type="static_library", sources=["keep.c"]
+        )
+        config = ProjectConfig(
+            name="proj", version="1.0", targets=[target], source_dir=tmp_path
+        )
+        build_dir = tmp_path / "build"
+        NinjaBackend(config, build_dir, _toolchain()).generate()
+        ninja = (build_dir / "build.ninja").read_text(encoding="utf-8")
+
+        ar_rule = ninja.split("rule ar_rule\n", 1)[1].split("\nrule ", 1)[0]
+        assert "ebuild.build.recreate_archive" in ar_rule
+        assert ar_rule.strip().startswith("command =")
+        # The bare update form is exactly the bug; it must not be the rule body.
+        assert "command = $ar rcs $out $in" not in ninja
+
+    def test_removing_source_drops_archive_member_with_stub_tools(self, tmp_path):
+        """Incremental rebuild must not keep a removed object in the archive.
+
+        Uses Python stub ``cc``/``ar`` tools so this runs without a host
+        toolchain (including on Windows CI runners that have no gcc).
+        """
+        pytest.importorskip("ninja", reason="ninja package not installed")
+
+        source_dir = tmp_path / "project"
+        source_dir.mkdir()
+        (source_dir / "keep.c").write_text("int keep(void) { return 1; }\n", encoding="utf-8")
+        (source_dir / "removed.c").write_text(
+            "int removed(void) { return 42; }\n", encoding="utf-8"
+        )
+
+        cc = _stub_cc(tmp_path)
+        ar = _stub_ar(tmp_path)
+        library = TargetConfig(
+            name="helpers",
+            target_type="static_library",
+            sources=["keep.c", "removed.c"],
+        )
+        config = ProjectConfig(
+            name="archive-regression",
+            version="1.0",
+            source_dir=source_dir,
+            targets=[library],
+        )
+        build_dir = source_dir / "build"
+        archive = build_dir / "libhelpers.a"
+        toolchain = SimpleNamespace(cc=str(cc), cxx=str(cc), ar=str(ar))
+
+        def build():
+            NinjaBackend(config, build_dir, toolchain).generate()
+            result = subprocess.run(
+                [sys.executable, "-m", "ninja", "-f", str(build_dir / "build.ninja")],
+                cwd=str(source_dir),
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+
+        def members():
+            return subprocess.check_output(
+                [str(ar), "t", str(archive)], text=True
+            ).splitlines()
+
+        build()
+        assert set(members()) == {"keep.o", "removed.o"}
+
+        library.sources.remove("removed.c")
+        (source_dir / "removed.c").unlink()
+        # Drop the stale object file too: Ninja would not rebuild it, but a
+        # real ``ar rcs`` update would still leave its member in the archive.
+        removed_obj = build_dir / "obj" / "helpers" / "removed.o"
+        if removed_obj.exists():
+            removed_obj.unlink()
+
+        build()
+        assert "removed.o" not in members(), members()
+        assert "keep.o" in members(), members()
+
+    def test_missing_archiver_is_a_clear_error(self, tmp_path):
+        """A missing `$ar` must not surface as an uncaught Python traceback."""
+        from ebuild.build.recreate_archive import main
+
+        archive = tmp_path / "lib.a"
+        archive.write_text("stale\n", encoding="utf-8")
+        code = main([str(archive), str(tmp_path / "no-such-ar"), "rcs", str(archive)])
+        assert code == 1
+        assert not archive.exists()
+
+
 if __name__ == "__main__":
     unittest.main()
