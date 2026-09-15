@@ -640,6 +640,38 @@ class TestStaticArchiveRecreation:
         assert archive.exists()
         assert archive.read_text(encoding="utf-8") == "stale\n"
 
+    def test_directory_archiver_preserves_existing_archive(self, tmp_path):
+        """A directory where ``ar`` was expected must not destroy a good archive."""
+        from ebuild.build.recreate_archive import main
+
+        archive = tmp_path / "lib.a"
+        archive.write_text("stale\n", encoding="utf-8")
+        as_dir = tmp_path / "ar-as-dir"
+        as_dir.mkdir()
+        code = main([str(archive), str(as_dir), "rcs", str(archive)])
+        assert code == 1
+        assert archive.read_text(encoding="utf-8") == "stale\n"
+
+    def test_non_executable_archiver_preserves_existing_archive(self, tmp_path):
+        """A present but non-executable `$ar` must not destroy a good archive."""
+        import os
+        import stat
+
+        from ebuild.build.recreate_archive import main
+
+        blocked = tmp_path / "ar-not-exec"
+        blocked.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        blocked.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+        if os.access(blocked, os.X_OK):
+            # Windows treats readable files as executable.
+            pytest.skip("os.access(X_OK) is true for readable files on this platform")
+
+        archive = tmp_path / "lib.a"
+        archive.write_text("stale\n", encoding="utf-8")
+        code = main([str(archive), str(blocked), "rcs", str(archive)])
+        assert code == 1
+        assert archive.read_text(encoding="utf-8") == "stale\n"
+
 
 if __name__ == "__main__":
     unittest.main()

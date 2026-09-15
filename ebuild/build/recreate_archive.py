@@ -20,10 +20,18 @@ puts ebuild on ``PYTHONPATH`` still builds static libraries.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _resolve_archiver(archiver: str) -> str | None:
+    """Return a runnable archiver path, or None if it cannot be executed."""
+    if os.path.isfile(archiver) and os.access(archiver, os.X_OK):
+        return archiver
+    return shutil.which(archiver)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     archive = Path(args[0])
     archiver = args[1]
     # Refuse to destroy a good archive when the archiver cannot run.
-    if not Path(archiver).exists() and shutil.which(archiver) is None:
+    if _resolve_archiver(archiver) is None:
         print(f"ebuild: cannot run archiver {archiver}: not found", file=sys.stderr)
         return 1
 
