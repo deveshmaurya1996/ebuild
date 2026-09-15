@@ -28,9 +28,15 @@ from pathlib import Path
 
 
 def _resolve_archiver(archiver: str) -> str | None:
-    """Return a runnable archiver path, or None if it cannot be executed."""
+    """Return an absolute runnable archiver path, or None.
+
+    A bare name that is executable in the process cwd must become absolute:
+    ``subprocess.call(["ar", …])`` uses PATH search and does not look in cwd,
+    so returning the relative name would pass the guard then fail after the
+    archive was already deleted.
+    """
     if os.path.isfile(archiver) and os.access(archiver, os.X_OK):
-        return archiver
+        return os.path.abspath(archiver)
     return shutil.which(archiver)
 
 
@@ -46,8 +52,14 @@ def main(argv: list[str] | None = None) -> int:
     archive = Path(args[0])
     archiver = args[1]
     # Refuse to destroy a good archive when the archiver cannot run.
-    if _resolve_archiver(archiver) is None:
-        print(f"ebuild: cannot run archiver {archiver}: not found", file=sys.stderr)
+    resolved = _resolve_archiver(archiver)
+    if resolved is None:
+        reason = (
+            "present but not executable"
+            if os.path.exists(archiver)
+            else "not found"
+        )
+        print(f"ebuild: cannot run archiver {archiver}: {reason}", file=sys.stderr)
         return 1
 
     try:
@@ -57,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        return subprocess.call(args[1:])
+        return subprocess.call([resolved, *args[2:]])
     except OSError as exc:
         print(f"ebuild: cannot run archiver {archiver}: {exc}", file=sys.stderr)
         return 1

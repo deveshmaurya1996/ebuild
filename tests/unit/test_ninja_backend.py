@@ -587,8 +587,6 @@ class TestStaticArchiveRecreation:
         env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
         env["PYTHONPATH"] = ""
 
-        # -S drops site-packages so an editable install of ebuild is invisible,
-        # matching a checkout that only puts the package on PYTHONPATH.
         module_form = subprocess.run(
             [
                 sys.executable,
@@ -629,7 +627,7 @@ class TestStaticArchiveRecreation:
         assert archive.exists()
         assert "lib.o" in archive.read_text(encoding="utf-8")
 
-    def test_missing_archiver_preserves_existing_archive(self, tmp_path):
+    def test_missing_archiver_preserves_existing_archive(self, tmp_path, capsys):
         """A missing `$ar` must fail without deleting a previously good archive."""
         from ebuild.build.recreate_archive import main
 
@@ -639,8 +637,9 @@ class TestStaticArchiveRecreation:
         assert code == 1
         assert archive.exists()
         assert archive.read_text(encoding="utf-8") == "stale\n"
+        assert "not found" in capsys.readouterr().err
 
-    def test_directory_archiver_preserves_existing_archive(self, tmp_path):
+    def test_directory_archiver_preserves_existing_archive(self, tmp_path, capsys):
         """A directory where ``ar`` was expected must not destroy a good archive."""
         from ebuild.build.recreate_archive import main
 
@@ -651,8 +650,9 @@ class TestStaticArchiveRecreation:
         code = main([str(archive), str(as_dir), "rcs", str(archive)])
         assert code == 1
         assert archive.read_text(encoding="utf-8") == "stale\n"
+        assert "present but not executable" in capsys.readouterr().err
 
-    def test_non_executable_archiver_preserves_existing_archive(self, tmp_path):
+    def test_non_executable_archiver_preserves_existing_archive(self, tmp_path, capsys):
         """A present but non-executable `$ar` must not destroy a good archive."""
         import os
         import stat
@@ -671,6 +671,70 @@ class TestStaticArchiveRecreation:
         code = main([str(archive), str(blocked), "rcs", str(archive)])
         assert code == 1
         assert archive.read_text(encoding="utf-8") == "stale\n"
+        assert "present but not executable" in capsys.readouterr().err
+
+    def test_cwd_only_archiver_is_resolved_absolutely(self, tmp_path, monkeypatch):
+        """A bare archiver name that only exists in cwd must still run.
+
+        ``os.path.isfile("ar")`` is cwd-relative, but ``subprocess.call(["ar"])``
+        searches PATH and skips cwd. Resolving to an absolute path keeps the
+        guard and the invoke agreeing so a good archive is not destroyed.
+        """
+        import os
+        import stat
+
+        from ebuild.build.recreate_archive import main
+
+        ar_impl = tmp_path / "_ar_impl.py"
+        ar_impl.write_text(
+            "\n".join(
+                [
+                    "import pathlib, sys",
+                    "op = sys.argv[1]",
+                    "archive = pathlib.Path(sys.argv[2])",
+                    "members = sys.argv[3:]",
+                    "if op == 't':",
+                    "    sys.stdout.write(",
+                    "        archive.read_text(encoding='utf-8') if archive.exists() else '')",
+                    "    raise SystemExit(0)",
+                    "names = {pathlib.Path(m).name for m in members}",
+                    "archive.write_text(",
+                    "    ('\\n'.join(sorted(names)) + '\\n') if names else '',",
+                    "    encoding='utf-8')",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        if os.name == "nt":
+            archiver_name = "ar.bat"
+            (tmp_path / archiver_name).write_text(
+                f'@echo off\r\n"{sys.executable}" "{ar_impl}" %*\r\n',
+                encoding="utf-8",
+            )
+        else:
+            archiver_name = "ar"
+            ar = tmp_path / archiver_name
+            ar.write_text(
+                f'#!/bin/sh\nexec "{sys.executable}" "{ar_impl}" "$@"\n',
+                encoding="utf-8",
+            )
+            ar.chmod(ar.stat().st_mode | stat.S_IEXEC)
+
+        empty_path = tmp_path / "empty-path"
+        empty_path.mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PATH", str(empty_path))
+
+        archive = tmp_path / "lib.a"
+        archive.write_text("stale\n", encoding="utf-8")
+        obj = tmp_path / "keep.o"
+        obj.write_bytes(b"obj:keep.c")
+
+        code = main([str(archive), archiver_name, "rcs", str(archive), str(obj)])
+        assert code == 0, "cwd-only archiver must run via absolute resolution"
+        assert "keep.o" in archive.read_text(encoding="utf-8")
+        assert "stale" not in archive.read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":
